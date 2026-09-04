@@ -10,6 +10,7 @@
          Inter + JetBrains Mono offline, install @fontsource packages and import
          them in app.js, or self-host the woff2 files. --}}
     @vite(['resources/js/app.js'])
+    @stack('head')
 </head>
 <body>
     <nav class="app-nav">
@@ -19,6 +20,7 @@
         </span>
         <span class="spacer"></span>
         <a href="{{ route('documents.index') }}" class="btn btn-ghost">Documentos</a>
+        <a href="{{ route('documents.works') }}" class="btn btn-ghost">Trabajos</a>
         <a href="{{ route('documents.create') }}" class="btn btn-primary">Subir PDF</a>
         <button class="theme-toggle" data-theme-toggle title="Cambiar tema" aria-label="Cambiar tema">◐</button>
     </nav>

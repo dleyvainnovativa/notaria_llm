@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Http\Requests\StoreDocumentRequest;
+use App\Jobs\ProcessDocumentJob;
 use App\Models\Document;
-use App\Services\AiExtractionService;
 use Illuminate\Http\RedirectResponse;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\Log;
@@ -14,10 +14,6 @@ use Illuminate\View\View;
 
 class DocumentController extends Controller
 {
-    public function __construct(
-        private readonly AiExtractionService $ai,
-    ) {}
-
     /** List of processed documents (simple prototype index). */
     public function index(): View
     {
@@ -35,75 +31,78 @@ class DocumentController extends Controller
     }
 
     /**
-     * Store the upload, call the AI service synchronously, save the result.
-     *
-     * Synchronous is acceptable for the prototype. The controller stays thin:
-     * validation is in the Form Request, the AI call is in the service.
+     * Store the upload and queue extraction. Returns immediately — the queue
+     * worker (php artisan queue:work) does the OCR + OpenAI call. Watch progress
+     * on the works page.
      */
     public function store(StoreDocumentRequest $request): RedirectResponse
     {
-        set_time_limit(0); // no PHP time limit for this synchronous extraction
-        try{
-        $file = $request->file('file');
+        try {
+            $file = $request->file('file');
 
-        // Store privately (NOT under public/). Stored name is random, so the
-        // original filename never drives the path.
-        $storedPath = $file->store('documents', 'local');
+            // Store privately (NOT under public/). Stored name is random, so the
+            // original filename never drives the path.
+            $storedPath = $file->store('documents', 'local');
 
-        $document = Document::create([
-            'uuid' => (string) Str::uuid(),
-            'original_filename' => $file->getClientOriginalName(),
-            'stored_path' => $storedPath,
-            'file_size' => $file->getSize(),
-            'template_id' => $request->string('template_id'),
-            'status' => 'processing',
-        ]);
+            $schema = (string) $request->string('json_schema');
 
-        $result = $this->ai->extract(
-            absolutePdfPath: Storage::disk('local')->path($storedPath),
-            originalFilename: $document->original_filename,
-            templateId: (string) $request->string('template_id'),
-            systemPrompt: (string) $request->string('system_prompt'),
-            extractionPrompt: (string) $request->string('extraction_prompt'),
-            jsonSchema: (string) $request->string('json_schema'),
-        );
-
-        if (! $result['ok']) {
-            Log::error('Error processing document: ' . $result['error'], ['exception' => $result['exception'] ?? null]);
-
-
-            $document->update([
-                'status' => 'failed',
-                'error_message' => $result['error'],
+            $document = Document::create([
+                'uuid' => (string) Str::uuid(),
+                'original_filename' => $file->getClientOriginalName(),
+                'stored_path' => $storedPath,
+                'file_size' => $file->getSize(),
+                'template_id' => $request->string('template_id'),
+                // Store the prompts so the job (and any reprocess) can run later,
+                // long after this request has ended.
+                'system_prompt' => (string) $request->string('system_prompt'),
+                'extraction_prompt' => (string) $request->string('extraction_prompt'),
+                'json_schema' => $schema !== '' ? json_decode($schema, true) : null,
+                'status' => 'queued',
             ]);
 
-            return redirect()
-                ->route('documents.show', $document)
-                ->with('error', $result['error']);
-        }
+            ProcessDocumentJob::dispatch($document->uuid);
 
-        $body = $result['data'];
+            return redirect()
+                ->route('documents.works')
+                ->with('success', 'Documento en cola. El procesamiento comenzará en breve.');
+        } catch (\Throwable $e) {
+            Log::error('Error queueing document: '.$e->getMessage(), ['exception' => $e]);
+
+            return redirect()
+                ->route('documents.create')
+                ->with('error', 'No se pudo poner el documento en cola.');
+        }
+    }
+
+    /** Re-queue a document that already finished or failed. */
+    public function reprocess(Document $document): RedirectResponse
+    {
+        if (! $document->canReprocess()) {
+            return redirect()
+                ->route('documents.works')
+                ->with('error', 'El documento ya está en cola o procesándose.');
+        }
 
         $document->update([
-            'status' => 'processed',
-            'model' => $body['model']['name'] ?? null,
-            'pages' => $body['document']['pages'] ?? null,
-            'text_extraction' => $body['document']['text_extraction'] ?? null,
-            'ocr_used' => $body['processing']['ocr_used'] ?? false,
-            'duration_ms' => $body['processing']['duration_ms'] ?? null,
-            'extracted_data' => $body['data'] ?? [],
-            'evidence' => $body['evidence'] ?? [],
+            'status' => 'queued',
+            'error_message' => null,
+            'processing_started_at' => null,
+            'processing_finished_at' => null,
         ]);
 
+        ProcessDocumentJob::dispatch($document->uuid);
+
         return redirect()
-            ->route('documents.show', $document)
-            ->with('success', 'Documento procesado.');
-        } catch (\Exception $e) {
-            Log::error('Error processing document: ' . $e->getMessage(), ['exception' => $e]);
-            return redirect()
-            ->route('documents.create')
-            ->with('error', 'Error processing document.');
-        }
+            ->route('documents.works')
+            ->with('success', 'Documento re-encolado.');
+    }
+
+    /** Works/jobs view: processing status per document. */
+    public function works(): View
+    {
+        $documents = Document::latest()->limit(100)->get();
+
+        return view('documents.works', compact('documents'));
     }
 
     /** Preview page: PDF beside extracted data. */
